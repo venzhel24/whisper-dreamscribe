@@ -5,21 +5,98 @@ import aiohttp
 import tempfile
 import os
 import traceback
-import torch
+import time
 from faster_whisper import WhisperModel
-
-print(torch.cuda.is_available())
-print(torch.cuda.get_device_name(0))
+from pathlib import Path
 
 print(f"[START] Загрузка модели Faster-Whisper: {settings.WHISPER_MODEL}")
+
+def find_local_model(model_name: str) -> Path:
+    """Ищет модель в локальных папках"""
+    possible_paths = [
+        Path(f"./models/{model_name}"),                              # Простое имя
+        Path(f"/app/models/{model_name}"),                           # Простое имя в контейнере
+        Path(f"./models/models--Systran--faster-whisper-{model_name}"),  # HuggingFace формат
+        Path(f"/app/models/models--Systran--faster-whisper-{model_name}"), # HuggingFace в контейнере
+        Path(f"./whisper_cache"),                                    # Старый формат кэша
+        Path(f"/app/whisper_cache"),                                 # Старый формат в контейнере
+    ]
+
+    for path in possible_paths:
+        if path.exists() and any(path.iterdir() if path.is_dir() else []):
+            print(f"[MODEL] Найдена локальная модель: {path}")
+            return path
+
+    return None
+
+def load_whisper_model():
+    """Загружает модель Whisper с поиском локальной версии"""
+    model_name = settings.WHISPER_MODEL
+
+    # 1. Ищем локальную модель
+    local_model_path = find_local_model(model_name)
+
+    if local_model_path:
+        try:
+            print(f"[MODEL] Попытка загрузки локальной модели из: {local_model_path}")
+
+            # Устанавливаем путь к кэшу
+            cache_dir = local_model_path.parent
+            os.environ['HF_HOME'] = str(cache_dir)
+            os.environ['TRANSFORMERS_CACHE'] = str(cache_dir)
+
+            model = WhisperModel(
+                model_name,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=8,
+                num_workers=2,
+                download_root=str(cache_dir)
+            )
+
+            print(f"[READY] Модель {model_name} загружена из локального кэша")
+            return model
+
+        except Exception as e:
+            print(f"[WARNING] Ошибка загрузки локальной модели: {e}")
+            print(f"[INFO] Переход к автоматическому скачиванию...")
+
+    # 2. Автоматическое скачивание если локальная модель не найдена
+    try:
+        print(f"[MODEL] Автоматическое скачивание модели {model_name}...")
+
+        # Создаем папку для моделей в контейнере
+        models_dir = Path("/app/models")
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        os.environ['HF_HOME'] = str(models_dir)
+        os.environ['TRANSFORMERS_CACHE'] = str(models_dir)
+
+        model = WhisperModel(
+            model_name,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=8,
+            num_workers=2,
+            download_root=str(models_dir)
+        )
+
+        print(f"[READY] Модель {model_name} загружена через автоскачивание")
+        return model
+
+    except Exception as e:
+        raise Exception(f"Не удалось загрузить модель {model_name}: {e}")
+
+# Загружаем модель
 try:
-    # faster-whisper использует WhisperModel вместо whisper.load_model
-    model = WhisperModel(settings.WHISPER_MODEL, device="cuda", compute_type="float16")
-    print("[READY] Модель Faster-Whisper загружена")
+    model = load_whisper_model()
 except Exception as e:
-    print(f"[FATAL] Не удалось загрузить модель Faster-Whisper: {e}")
+    print(f"[FATAL] Не удалось загрузить модель: {e}")
     raise
 
+REDIS_CONNECTION_CONFIG = {"connection": settings.REDIS_URL}
+
+# Остальной код остается без изменений...
 async def download_audio(url: str) -> str:
     print(f"[DOWNLOAD] Скачивание аудио из {url}")
     connector = aiohttp.TCPConnector(ssl=False)
@@ -45,7 +122,11 @@ async def convert_to_wav_async(input_path: str) -> str:
     print(f"[CONVERT] Конвертация {input_path} в {output_path} через ffmpeg (async)")
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", input_path, output_path,
+            "ffmpeg", "-y", "-i", input_path,
+            "-ar", "16000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            output_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -60,30 +141,45 @@ async def convert_to_wav_async(input_path: str) -> str:
         traceback.print_exc()
         raise
 
+async def transcribe_with_faster_whisper(wav_path: str) -> str:
+    print(f"[WHISPER] Начинается транскрипция файла {wav_path}")
+    start_time = time.time()
+
+    loop = asyncio.get_event_loop()
+
+    def transcribe_sync():
+        segments, info = model.transcribe(
+            wav_path,
+            language=None if settings.WHISPER_LANGUAGE == "auto" else settings.WHISPER_LANGUAGE,
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            condition_on_previous_text=False
+        )
+
+        text = "".join([segment.text for segment in segments])
+        return text, info
+
+    text, info = await loop.run_in_executor(None, transcribe_sync)
+    end_time = time.time()
+
+    print(f"[WHISPER] Время обработки: {end_time - start_time:.2f} секунд")
+    print(f"[WHISPER] Определенный язык: {info.language} (вероятность: {info.language_probability:.2%})")
+    print(f"[WHISPER] Транскрипция завершена")
+    return text
+
 async def process(job, job_token):
     data = job.data
     print(f"[QUEUE] Получена задача: userId={data.get('userId')}, messageId={data.get('messageId')}, audioUrl={data.get('audioUrl')}")
     audio_path = None
     wav_path = None
     try:
-        # Скачивание аудио
         audio_path = await download_audio(data['audioUrl'])
-
-        # Конвертация в wav
         wav_path = await convert_to_wav_async(audio_path)
-
-        # Транскрипция с faster-whisper
-        print(f"[WHISPER] Начинается транскрипция файла {wav_path}")
-        loop = asyncio.get_event_loop()
-
-        # faster-whisper возвращает кортеж (segments, info)
-        def transcribe_sync():
-            segments, info = model.transcribe(wav_path)
-            # Собираем текст из всех сегментов
-            text = "".join([segment.text for segment in segments])
-            return text
-
-        text = await loop.run_in_executor(None, transcribe_sync)
+        text = await transcribe_with_faster_whisper(wav_path)
         print(f"[WHISPER] Транскрипция завершена. Текст:\n{text}\n")
 
         transcription_result = {
@@ -92,12 +188,16 @@ async def process(job, job_token):
             'messageId': data['messageId']
         }
 
-        # Отправка результата в очередь
         print(f"[QUEUE] Отправка результата в очередь {settings.RESULTS_QUEUE}")
-        result_queue = Queue(settings.RESULTS_QUEUE)
-        await result_queue.add("result", transcription_result)
-        await result_queue.close()
-        print(f"[QUEUE] Результат отправлен для userId={data['userId']}, messageId={data['messageId']}")
+        try:
+            result_queue = Queue(settings.RESULTS_QUEUE, REDIS_CONNECTION_CONFIG)
+            await result_queue.add("result", transcription_result)
+            await result_queue.close()
+            print(f"[QUEUE] Результат успешно отправлен для userId={data['userId']}, messageId={data['messageId']}")
+        except Exception as redis_error:
+            print(f"[ERROR] Ошибка отправки в Redis: {redis_error}")
+            raise
+
         return transcription_result
 
     except Exception as e:
@@ -129,7 +229,7 @@ async def main():
     worker = Worker(
         settings.JOBS_QUEUE,
         process,
-        {"connection": settings.REDIS_URL}
+        REDIS_CONNECTION_CONFIG
     )
 
     print("[WORKER] Воркер запущен и ожидает задачи...")
@@ -139,5 +239,5 @@ async def main():
     print("[WORKER] Воркер остановлен.")
 
 if __name__ == "__main__":
-    print("[SYSTEM] Запуск whisper-worker")
+    print("[SYSTEM] Запуск whisper-worker с faster-whisper")
     asyncio.run(main())
