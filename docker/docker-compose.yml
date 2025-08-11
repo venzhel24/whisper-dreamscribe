@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  whisper-dreamscribe:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: whisper-dreamscribe:latest
+    container_name: whisper-dreamscribe
+    environment:
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_URL=redis://${REDIS_HOST:-redis}:${REDIS_PORT:-6379}
+      - WHISPER_MODEL=${WHISPER_MODEL:-large-v2}
+      - WHISPER_THREADS=${WHISPER_THREADS:-8}
+      - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-auto}
+      - JOBS_QUEUE=${JOBS_QUEUE:-transcription_jobs}
+      - RESULTS_QUEUE=${RESULTS_QUEUE:-transcription_results}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ../logs:/app/logs
+      - ../models:/app/models:ro
+    restart: unless-stopped
+    networks:
+      - dreamscribe-network
+    deploy:
+      resources:
+        limits:
+          cpus: '6.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+networks:
+  dreamscribe-network:
+    external: true
+    name: dreamscribe-network

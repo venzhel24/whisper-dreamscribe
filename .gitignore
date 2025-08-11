@@ -19,25 +19,18 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
 # Virtual environments
-venv/
-env/
-ENV/
-
-# Environment files
 .env
-.env.local
-.env.production
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Logs
-logs/
-*.log
-
-# Docker
-.dockerignore
-
-# IDE
+# IDEs
 .vscode/
 .idea/
 *.swp
@@ -45,10 +38,32 @@ logs/
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+
+# Project specific
+logs/
+*.log
+
+# Docker
+.dockerignore
 
 # Temporary files
 tmp/
 temp/
+*.tmp
+*.temp
 
-models
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Documentation
+docs/_build/
+/models/
